@@ -145,6 +145,8 @@ h1, h2, h3 { margin: 0; font-weight: 800 }
 .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 14px }
 .stat { background: var(--card); border-radius: 18px; padding: 12px 8px; text-align: center; box-shadow: var(--shadow) }
 .stat b { display: block; font-size: 24px; font-weight: 800 } .stat span { font-size: 12px; color: var(--muted) }
+.cloud { display: flex; align-items: center; gap: 12px; width: 100%; text-align: right; margin-bottom: 14px; padding: 14px 16px; background: var(--teal-soft) }
+.cloud > span:first-child { font-size: 26px } .cloud small { display: block; color: var(--muted); font-size: 13px }
 .catrow { margin-bottom: 12px } .catrow:last-child { margin: 0 } .catrow .row { justify-content: space-between; font-size: 14px; margin-bottom: 5px }
 
 /* ניווט תחתון */
@@ -212,9 +214,11 @@ const lvWords = n => W.filter(w => w.lv === n);
 const range = n => (n === 1 ? 1 : LV[n - 2] + 1) + '–' + LV[n - 1];
 
 /* ---------- מצב שמור ---------- */
-let S = { w: {}, un: 1, goal: 10, auto: true, days: {}, td: { d: '', ids: [] } };
+const fresh = () => ({ w: {}, un: 1, goal: 10, auto: true, days: {}, td: { d: '', ids: [] }, t: 0, r: 0 });
+let S = fresh();
 try { Object.assign(S, JSON.parse(localStorage.getItem(KEY) || '{}')); } catch (e) {}
-const save = () => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} };
+const store = () => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} };
+const save = () => { S.t = Date.now(); store(); if (window.SP_PUSH) window.SP_PUSH(); };
 const stat = w => (S.w[w.id] ? S.w[w.id].s : 0); // 0 חדשה, 1 בלמידה, 2 במאגר
 const today = (t) => { const d = t ? new Date(t) : new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); };
 function touch(w) {
@@ -230,8 +234,8 @@ function streak() {
   while (S.days[today(t)]) { n++; t -= DAY; }
   return n;
 }
-const setKnown = w => { S.w[w.id] = { s: 2, b: 0, d: Date.now() + BOX[0] * DAY }; };
-const setLearning = w => { S.w[w.id] = { s: 1, c: 0 }; };
+const setKnown = w => { S.w[w.id] = { s: 2, b: 0, d: Date.now() + BOX[0] * DAY, t: Date.now() }; };
+const setLearning = w => { S.w[w.id] = { s: 1, c: 0, t: Date.now() }; };
 const dueWords = () => W.filter(w => stat(w) === 2 && S.w[w.id].d <= Date.now());
 const knownCount = list => list.filter(w => stat(w) === 2).length;
 
@@ -243,14 +247,52 @@ function grade(w, ok, mode) {
   let gained = false;
   if (!ok) setLearning(w);
   else if (r && r.s === 2) {
-    if (r.d <= Date.now()) { r.b = Math.min((r.b || 0) + 1, BOX.length - 1); r.d = Date.now() + BOX[r.b] * DAY; }
+    if (r.d <= Date.now()) { r.b = Math.min((r.b || 0) + 1, BOX.length - 1); r.d = Date.now() + BOX[r.b] * DAY; r.t = Date.now(); }
   } else {
     const c = ((r && r.c) || 0) + 1;
-    if (c >= 2) { setKnown(w); gained = true; } else S.w[w.id] = { s: 1, c };
+    if (c >= 2) { setKnown(w); gained = true; } else S.w[w.id] = { s: 1, c, t: Date.now() };
   }
   save();
   return gained;
 }
+
+/* ---------- סנכרון בין מכשירים (sync.js) ---------- */
+/* מיזוג שני מצבים: לכל מילה נשמר העדכון האחרון; איפוס מוחק כל מה שקדם לו */
+function mergeState(a, b) {
+  const newer = (b.t || 0) > (a.t || 0) ? b : a;
+  const o = Object.assign(fresh(), newer);
+  o.r = Math.max(a.r || 0, b.r || 0);
+  o.t = Math.max(a.t || 0, b.t || 0);
+  o.un = Math.max(a.un || 1, b.un || 1);
+  o.w = {};
+  for (const src of [a.w || {}, b.w || {}]) for (const k in src) {
+    const x = src[k], cur = o.w[k];
+    if ((x.t || 0) < o.r) continue;
+    if (!cur || (x.t || 0) > (cur.t || 0) || ((x.t || 0) === (cur.t || 0) && x.s > cur.s)) o.w[k] = x;
+  }
+  o.days = Object.assign({}, a.days);
+  for (const d in b.days || {}) o.days[d] = Math.max(o.days[d] || 0, b.days[d]);
+  const ta = a.td || { d: '' }, tb = b.td || { d: '' };
+  o.td = ta.d === tb.d ? { d: ta.d, ids: [...new Set([...(ta.ids || []), ...(tb.ids || [])])] } : (ta.d > tb.d ? ta : tb);
+  if (o.td.d) o.days[o.td.d] = Math.max(o.days[o.td.d] || 0, o.td.ids.length);
+  return o;
+}
+let ACC = { state: 'loading', user: null };
+const inSession = () => /^#(learn|quiz|result)$/.test(location.hash);
+window.SP = {
+  get: () => S,
+  /* ממזג את מה ששמור בענן עם מה שבמכשיר */
+  merge(remote) {
+    if (!remote) return;
+    const before = JSON.stringify(S);
+    S = mergeState(S, remote);
+    store();
+    if (JSON.stringify(S) !== before && !inSession()) route(true);
+  },
+  account(a) { ACC = Object.assign(ACC, a); if (!inSession() && /^#(more|home)?$/.test(location.hash || '#')) route(true); },
+  toast: m => toast(m)
+};
+setTimeout(() => { if (ACC.state === 'loading') SP.account({ state: 'unavailable' }); }, 10000);
 
 /* ---------- עזרים ---------- */
 const $app = document.getElementById('app'), $layer = document.getElementById('layer'), $nav = document.getElementById('nav');
@@ -307,7 +349,7 @@ function nav(h, replace) {
   else if (location.hash !== '#' + h) history.pushState(null, '', '#' + h);
   route();
 }
-function route() {
+function route(keep) {
   const h = location.hash.slice(1) || 'home';
   $layer.innerHTML = '';
   let tab = '', session = false;
@@ -321,7 +363,7 @@ function route() {
   $nav.style.display = session ? 'none' : '';
   $app.classList.toggle('session', session);
   $nav.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
-  window.scrollTo(0, 0);
+  if (keep !== true) window.scrollTo(0, 0);
 }
 window.addEventListener('popstate', route);
 
@@ -334,6 +376,7 @@ function vHome() {
   const k = knownCount(W), done = doneToday(), st = streak(), due = dueWords().length, nl = nextLevel();
   const C = 2 * Math.PI * 48;
   let h = `<div class="hello"><h1><span class="es">¡Hola!</span> 👋<small>ספרדית, מילה אחרי מילה</small></h1><span class="chip">🔥 ${st} ${st === 1 ? 'יום' : 'ימים'}</span></div>
+  ${ACC.state === 'out' ? `<button class="card cloud" onclick="A.signIn()"><span>☁️</span><span class="grow"><b>שמירה בענן</b><small>התחבר עם Google כדי להמשיך מכל מכשיר</small></span><span class="muted">‹</span></button>` : ''}
   <div class="card hero">
     <div class="ring"><svg width="112" height="112"><circle cx="56" cy="56" r="48" fill="none" stroke="rgba(255,255,255,.3)" stroke-width="11"/><circle cx="56" cy="56" r="48" fill="none" stroke="#fff" stroke-width="11" stroke-linecap="round" stroke-dasharray="${C}" stroke-dashoffset="${C * (1 - k / W.length)}"/></svg><b>${k}</b></div>
     <div class="grow"><h2>מילים שאני כבר יודע</h2><p>מתוך ${W.length} הראשונות</p>
@@ -559,6 +602,7 @@ function vMore() {
   const k = knownCount(W), lrn = W.filter(w => stat(w) === 1).length;
   let h = `<div class="hello"><h1>ההתקדמות שלי</h1></div>
   <div class="stats"><div class="stat"><b>${k}</b><span>במאגר שלי</span></div><div class="stat"><b>${lrn}</b><span>בלמידה</span></div><div class="stat"><b>🔥 ${streak()}</b><span>ימים ברצף</span></div></div>
+  <h2 class="sec">חשבון וסנכרון</h2><div class="card" style="padding:4px 18px">${accountBox()}</div>
   <h2 class="sec">לפי קטגוריה</h2><div class="card">`;
   Object.keys(CATS).forEach(c => {
     const ws = W.filter(w => w.cat === c), kk = knownCount(ws);
@@ -572,6 +616,17 @@ function vMore() {
     <div class="set"><div>התחלה מחדש<small>מחיקת כל ההתקדמות</small></div><button class="mini danger" onclick="A.reset()">איפוס</button></div>
   </div>`;
   $app.innerHTML = h;
+}
+
+function accountBox() {
+  const u = ACC.user;
+  if (u) {
+    const st = { syncing: '🔄 מסנכרן…', ok: '✓ מסונכרן', offline: '📴 אין חיבור. יסונכרן כשהחיבור יחזור', error: '⚠️ הסנכרון נכשל, ננסה שוב' }[ACC.state] || '';
+    return `<div class="set"><div class="grow" style="min-width:0">${u.name || 'מחובר'}<small style="direction:ltr;text-align:right;overflow:hidden;text-overflow:ellipsis">${u.email || ''}</small><small>${st}</small></div><button class="mini" onclick="A.signOut()">התנתק</button></div>`;
+  }
+  if (ACC.state === 'loading') return `<div class="set"><div>☁️ טוען…</div></div>`;
+  if (ACC.state === 'unavailable') return `<div class="set"><div>☁️ הסנכרון לא זמין כרגע<small>ההתקדמות נשמרת במכשיר. בדוק את החיבור לאינטרנט</small></div></div>`;
+  return `<div class="set"><div>☁️ שמירה בענן<small>התחבר כדי להמשיך מאותה נקודה בכל מכשיר ודפדפן</small></div><button class="mini" onclick="A.signIn()">התחבר עם Google</button></div>`;
 }
 
 /* ---------- חלון מילה ---------- */
@@ -591,6 +646,8 @@ function wordSheet(i) {
 /* ---------- פעולות ---------- */
 window.A = {
   nav,
+  signIn() { if (window.SP_SIGNIN) window.SP_SIGNIN(); else toast('הסנכרון לא זמין כרגע. בדוק את החיבור לאינטרנט'); },
+  signOut() { if (confirm('להתנתק? ההתקדמות תישאר שמורה גם במכשיר וגם בענן.') && window.SP_SIGNOUT) window.SP_SIGNOUT(); },
   say: i => speak(W[i].es), sayEx: i => speak(W[i].ex),
   openLevel(n) { if (n > S.un) return toast(`כדי לפתוח את שלב ${n} צריך לעבור את מבחן שלב ${n - 1}`); curCat = 'all'; nav('l' + n); },
   cat(c) { curCat = c; const x = document.querySelector('.chips').scrollLeft; vLevel(); document.querySelector('.chips').scrollLeft = x; },
@@ -618,16 +675,17 @@ window.A = {
     const f = inp.files[0]; if (!f) return;
     const r = new FileReader();
     r.onload = () => {
-      try { const d = JSON.parse(r.result); if (!d || typeof d.w !== 'object') throw 0; S = Object.assign({ w: {}, un: 1, goal: 10, auto: true, days: {}, td: { d: '', ids: [] } }, d); save(); toast('ההתקדמות שוחזרה ✓'); vMore(); }
+      try { const d = JSON.parse(r.result); if (!d || typeof d.w !== 'object') throw 0; S = mergeState(Object.assign(fresh(), d), { t: 0, r: 0, w: {}, days: {}, td: { d: '' } }); save(); toast('ההתקדמות שוחזרה ✓'); vMore(); }
       catch (e) { toast('הקובץ לא תקין'); }
     };
     r.readAsText(f);
   },
-  reset() { if (confirm('למחוק את כל ההתקדמות ולהתחיל מחדש?')) { S = { w: {}, un: 1, goal: 10, auto: true, days: {}, td: { d: '', ids: [] } }; save(); toast('ההתקדמות אופסה'); vMore(); } }
+  reset() { if (confirm('למחוק את כל ההתקדמות ולהתחיל מחדש?')) { S = fresh(); S.r = Date.now(); save(); toast('ההתקדמות אופסה'); vMore(); } }
 };
 
 route();
 })();
 </script>
+<script type="module" src="sync.js"></script>
 </body>
 </html>
